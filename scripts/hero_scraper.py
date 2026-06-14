@@ -30,32 +30,37 @@ def _find_cached_chromedriver():
     return candidates[0]
 
 
-def _get_chromedriver_path():
+def _init_driver_with_fallback(chrome_options):
     """
-    三层降级策略获取 ChromeDriver 路径:
-    1. 使用本地已缓存的 ChromeDriver (无需联网)
-    2. 通过 webdriver_manager 联网下载 (自动检测系统代理)
-    3. 返回 None, 让 Selenium 自行查找 (Chrome 115+ 内置支持)
+    尝试初始化 ChromeDriver，包含降级和缓存失效处理策略。
     """
-    # --- 第 1 层: 本地缓存 (最快, 无需网络) ---
-    cached = _find_cached_chromedriver()
-    if cached:
-        print(f"   [Driver] 使用本地缓存: {cached}")
-        return cached
+    # 1. 尝试使用本地缓存
+    cached_path = _find_cached_chromedriver()
+    if cached_path:
+        print(f"   [Driver] 尝试使用本地缓存: {cached_path}")
+        try:
+            service = Service(cached_path)
+            return webdriver.Chrome(service=service, options=chrome_options)
+        except WebDriverException as e:
+            if "session not created" in str(e).lower() or "version of chromedriver" in str(e).lower():
+                print(f"   [Driver] ⚠ 本地缓存版本与当前浏览器不匹配，将重新下载...")
+            else:
+                raise
     
-    # --- 第 2 层: webdriver_manager 联网下载 ---
+    # 2. 尝试使用 webdriver_manager 联网下载最新版
     try:
         from webdriver_manager.chrome import ChromeDriverManager
-        print("   [Driver] 本地无缓存，尝试联网下载 ChromeDriver...")
+        print("   [Driver] 尝试联网下载最新的 ChromeDriver...")
         path = ChromeDriverManager().install()
         print(f"   [Driver] 下载成功: {path}")
-        return path
+        service = Service(path)
+        return webdriver.Chrome(service=service, options=chrome_options)
     except Exception as e:
         print(f"   [Driver] 联网下载失败 (可能需要代理/梯子): {e}")
-    
-    # --- 第 3 层: 让 Selenium 自行查找 ---
+        
+    # 3. 降级: 由 Selenium 自动查找 ChromeDriver
     print("   [Driver] 降级: 由 Selenium 自动查找 ChromeDriver...")
-    return None
+    return webdriver.Chrome(options=chrome_options)
 
 
 def setup_driver():
@@ -79,13 +84,7 @@ def setup_driver():
     })
     chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
-    driver_path = _get_chromedriver_path()
-    if driver_path:
-        service = Service(driver_path)
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-    else:
-        # Selenium 4.6+ 自带 driver manager，无需指定路径
-        driver = webdriver.Chrome(options=chrome_options)
+    driver = _init_driver_with_fallback(chrome_options)
 
     # 不设置隐式等待，全部使用显式等待 (WebDriverWait)，避免超时累加
     return driver
@@ -217,13 +216,19 @@ def scrape_single_champion(driver, cn_name, en_name, is_first_page=False):
         tier_data = {}
         prev_names = all_names  # 用于智能等待对比
 
-        for tier_name in ["白银", "黄金", "棱彩"]:
-            if click_tab_and_wait(driver, tier_name, prev_names):
+        tier_mapping = {
+            "白银": "银",
+            "黄金": "黄金",
+            "棱彩": "棱镜"
+        }
+
+        for internal_tier, tab_name in tier_mapping.items():
+            if click_tab_and_wait(driver, tab_name, prev_names):
                 tier_names = extract_augment_names_fast(driver)
-                print(f"   > 「{tier_name}」共 {len(tier_names)} 个")
+                print(f"   > 「{internal_tier}」共 {len(tier_names)} 个")
                 for idx, name in enumerate(tier_names, 1):
                     if name not in tier_data:
-                        tier_data[name] = {"tier": tier_name, "t_rank": idx}
+                        tier_data[name] = {"tier": internal_tier, "t_rank": idx}
                 prev_names = tier_names  # 更新对比基准
 
         # 3. 合并数据
@@ -264,15 +269,17 @@ def scrape_single_champion(driver, cn_name, en_name, is_first_page=False):
 # ==========================================
 # 批量抓取入口
 # ==========================================
-def crawl_champions(target_list):
+def crawl_champions(target_list, early_stop_func=None):
     """
     直接返回内存字典，不再写临时文件
+    early_stop_func: 接收 (cn_name, crawled_data) 返回 bool，若返回 True 则提前终止抓取
     """
     print(f"--- 开始抓取 {len(target_list)} 个英雄 ---")
 
     driver = setup_driver()
     failed_list = []
     success_data = {}
+    early_stopped = False
 
     MAX_RETRIES = 3
 
@@ -297,6 +304,8 @@ def crawl_champions(target_list):
                 if status == "clean" and data:
                     success_data[cn_name] = data
                     print(f"   > 成功抓取 {len(data)} 条")
+                    if early_stop_func and early_stop_func(cn_name, data):
+                        early_stopped = True
                     break
                 else:
                     print(f"   > 数据为空 (状态: {status})，重试 ({attempt}/{MAX_RETRIES})")
@@ -313,6 +322,10 @@ def crawl_champions(target_list):
                 else:
                     print(f"   > ❌ {cn_name} 失败")
                     failed_list.append(cn_name)
+
+            if early_stopped:
+                print(f"   > ⚠️ 触发提前结束条件，停止后续抽样。")
+                break
 
             # 英雄间短暂间隔，避免被反爬
             time.sleep(random.uniform(0.3, 0.8))

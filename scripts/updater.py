@@ -200,7 +200,7 @@ def compare_hero_data(history_rows, crawled_items):
     return local_set != remote_set
 
 def spot_check_and_update(official_en_to_cn, history_data, sample_size=3):
-    """随机抽取英雄进行抽样比对，如有差异则触发全量更新"""
+    """随机抽取英雄进行抽样比对，一旦发现有差异立即触发全量更新"""
     all_en_names = list(official_en_to_cn.keys())
     # 优先从有历史数据的英雄中抽样，这样比对才有意义
     candidates = [en for en in all_en_names if en in history_data]
@@ -213,29 +213,32 @@ def spot_check_and_update(official_en_to_cn, history_data, sample_size=3):
     print(f"\n>>> 🎲 抽样比对: 随机选取 {len(sample_list)} 个英雄进行线上数据校验...")
     print(f"    抽中: {', '.join([cn for cn, _ in sample_list])}")
     
-    sample_data, failed = crawler.crawl_champions(sample_list)
-    
-    if failed:
-        print(f"\n⚠️ 抽样爬取失败的英雄: {failed}，跳过失败英雄继续比对。")
-        # 不丢弃已成功的数据，只跳过失败的
-    
-    has_diff = False
     official_cn_to_en = {cn: en for en, cn in official_en_to_cn.items()}
-    
-    for cn_name, crawled_items in sample_data.items():
+    has_diff = False
+
+    def check_diff_callback(cn_name, crawled_items):
+        nonlocal has_diff
         en_name = official_cn_to_en.get(cn_name, cn_name)
         local_rows = history_data.get(en_name, [])
         
         if not local_rows:
             print(f"    ⚡ [{cn_name}] 本地无数据 → 存在差异")
             has_diff = True
-            continue
-        
+            return True  # 触发提前结束
+            
         if compare_hero_data(local_rows, crawled_items):
             print(f"    ⚡ [{cn_name}] 数据有变动 → 存在差异")
             has_diff = True
+            return True  # 触发提前结束
         else:
             print(f"    ✅ [{cn_name}] 数据一致")
+            return False
+
+    sample_data, failed = crawler.crawl_champions(sample_list, early_stop_func=check_diff_callback)
+    
+    if failed:
+        print(f"\n⚠️ 抽样爬取失败的英雄: {failed}，跳过失败英雄继续比对。")
+        # 不丢弃已成功的数据，只跳过失败的
     
     return has_diff, sample_data
 
